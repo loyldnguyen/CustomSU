@@ -74,7 +74,7 @@ on:
         default: false
   push:
     paths:
-      - '.github/workflows/build-manager.yml'
+      - '.github/workflows/**'
 
 # Fixed defaults, used when inputs are empty (push events)
 env:
