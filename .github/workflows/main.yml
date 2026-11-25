@@ -1,0 +1,732 @@
+name: Build Manager
+
+# Self-contained workflow: clones the BakaSU source (default Baka-SU/BakaSU),
+# so it also works in an otherwise empty repository.
+# Required secrets in THIS repo: KEYSTORE, KEY_ALIAS, KEYSTORE_PASSWORD, KEY_PASSWORD
+# Optional: secret BOT_TOKEN, vars CHAT_ID / MESSAGE_THREAD_ID (Telegram upload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Repo mã nguồn BakaSU (owner/repo)'
+        required: false
+        type: string
+        default: 'Baka-SU/BakaSU'
+      source_ref:
+        description: 'Nhánh / tag / commit của mã nguồn'
+        required: false
+        type: string
+        default: 'main'
+      manager_sign_size:
+        description: 'Manager signature size (vd: 0x033b hoặc 827)'
+        required: false
+        type: string
+        default: '0x02cb'
+      manager_sign_hash:
+        description: 'Manager signature SHA256 hash (64 ký tự hex)'
+        required: false
+        type: string
+        default: 'f67905ad7dc13109eda756db93ed67309ba44b7cb19856e89b9351a5c299dcd0'
+      manager_package_name:
+        description: 'Manager package name (vd: com.example.manager). Để trống = mặc định'
+        required: false
+        type: string
+        default: ''
+      manager_label_name:
+        description: 'Manager label (tên app hiển thị). Để trống = mặc định'
+        required: false
+        type: string
+        default: ''
+      manager_icon:
+        description: 'Custom icon: URL ảnh (png/jpg/webp, nhận cả link github.com/.../blob/...) hoặc đường dẫn file trong repo này. Để trống = mặc định'
+        required: false
+        type: string
+        default: ''
+      build_types:
+        description: 'Loại manager cần build'
+        required: false
+        type: choice
+        default: 'release'
+        options:
+          - 'release'
+          - 'debug'
+          - 'release + debug'
+      abis:
+        description: 'Kiến trúc (ABI) cần build ksud / đóng gói vào APK'
+        required: false
+        type: choice
+        default: 'arm64-v8a'
+        options:
+          - 'arm64-v8a'
+          - 'arm64-v8a,armeabi-v7a'
+          - 'arm64-v8a,x86_64'
+          - 'all'
+      build_lkm:
+        description: 'Build LKM (kernelsu.ko). Tắt = nhanh hơn nhưng manager không cài được LKM'
+        required: false
+        type: boolean
+        default: false
+      upload_telegram:
+        description: 'Upload lên Telegram'
+        required: false
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/build-manager.yml'
+
+# Fixed defaults, used when inputs are empty (push events)
+env:
+  DEFAULT_SOURCE_REPO: 'Baka-SU/BakaSU'
+  DEFAULT_SOURCE_REF: 'main'
+  DEFAULT_SIGN_SIZE: '0x02cb'
+  DEFAULT_SIGN_HASH: 'f67905ad7dc13109eda756db93ed67309ba44b7cb19856e89b9351a5c299dcd0'
+  DEFAULT_BUILD_TYPES: 'release'
+  DEFAULT_ABIS: 'arm64-v8a'
+  DEFAULT_BUILD_LKM: 'false'
+  DEFAULT_UPLOAD_TELEGRAM: 'false'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      source_repo: ${{ steps.opts.outputs.source_repo }}
+      source_sha: ${{ steps.opts.outputs.source_sha }}
+      build_types: ${{ steps.opts.outputs.build_types }}
+      ksud_targets: ${{ steps.opts.outputs.ksud_targets }}
+      lkm_arches: ${{ steps.opts.outputs.lkm_arches }}
+      abi_args: ${{ steps.opts.outputs.abi_args }}
+      build_lkm: ${{ steps.opts.outputs.build_lkm }}
+      upload_telegram: ${{ steps.opts.outputs.upload_telegram }}
+      package_name: ${{ steps.opts.outputs.package_name }}
+      expected_size: ${{ steps.opts.outputs.expected_size }}
+      expected_hash: ${{ steps.opts.outputs.expected_hash }}
+    steps:
+      - name: Resolve build options
+        id: opts
+        env:
+          IN_SOURCE_REPO: ${{ inputs.source_repo }}
+          IN_SOURCE_REF: ${{ inputs.source_ref }}
+          IN_BUILD_TYPES: ${{ inputs.build_types }}
+          IN_ABIS: ${{ inputs.abis }}
+          IN_BUILD_LKM: ${{ inputs.build_lkm }}
+          IN_UPLOAD_TG: ${{ inputs.upload_telegram }}
+          IN_PACKAGE: ${{ inputs.manager_package_name }}
+          SIGN_SIZE: ${{ inputs.manager_sign_size }}
+          SIGN_HASH: ${{ inputs.manager_sign_hash }}
+        run: |
+          set -euo pipefail
+
+          # --- Source ---
+          SOURCE_REPO=$(echo "${IN_SOURCE_REPO:-$DEFAULT_SOURCE_REPO}" | tr -d '[:space:]')
+          SOURCE_REF=$(echo "${IN_SOURCE_REF:-$DEFAULT_SOURCE_REF}" | tr -d '[:space:]')
+          [[ "$SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::Invalid source_repo: $SOURCE_REPO"; exit 1; }
+          if [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            SOURCE_SHA="$SOURCE_REF"
+          else
+            SOURCE_SHA=$(git ls-remote "https://github.com/$SOURCE_REPO" "refs/heads/$SOURCE_REF" "refs/tags/$SOURCE_REF^{}" "refs/tags/$SOURCE_REF" | head -n 1 | cut -f1)
+            [ -n "$SOURCE_SHA" ] || { echo "::error::Ref '$SOURCE_REF' not found in $SOURCE_REPO"; exit 1; }
+          fi
+
+          # --- Build types ---
+          case "${IN_BUILD_TYPES:-$DEFAULT_BUILD_TYPES}" in
+            release) BUILD_TYPES='["release"]' ;;
+            debug)   BUILD_TYPES='["debug"]' ;;
+            *)       BUILD_TYPES='["release","debug"]' ;;
+          esac
+
+          # --- ABIs ---
+          ABIS=$(echo "${IN_ABIS:-$DEFAULT_ABIS}" | tr -d '[:space:]')
+          [ "$ABIS" = "all" ] && ABIS="arm64-v8a,armeabi-v7a,x86_64,riscv64"
+          TARGETS=(); LKM=(); ABI_ARGS=""
+          IFS=',' read -ra LIST <<< "$ABIS"
+          for abi in "${LIST[@]}"; do
+            case "$abi" in
+              arm64-v8a)   TARGETS+=('"aarch64-linux-android"');   LKM+=('"arm64"') ;;
+              armeabi-v7a) TARGETS+=('"armv7-linux-androideabi"'); LKM+=('"arm64"') ;;  # armv8l devices use arm64 .ko
+              x86_64)      TARGETS+=('"x86_64-linux-android"');    LKM+=('"x86_64"') ;;
+              riscv64)     TARGETS+=('"riscv64-linux-android"') ;;
+              *) echo "::error::Unknown ABI: $abi"; exit 1 ;;
+            esac
+            ABI_ARGS="$ABI_ARGS -a $abi"
+          done
+          KSUD_TARGETS="[$(IFS=,; echo "${TARGETS[*]}")]"
+          LKM_ARCHES="[$(printf '%s\n' "${LKM[@]:-}" | sed '/^$/d' | sort -u | paste -sd,)]"
+
+          # --- Toggles ---
+          BUILD_LKM=true; [ "${IN_BUILD_LKM:-$DEFAULT_BUILD_LKM}" = "false" ] && BUILD_LKM=false
+          [ "$LKM_ARCHES" = "[]" ] && BUILD_LKM=false
+          UPLOAD_TG=true; [ "${IN_UPLOAD_TG:-$DEFAULT_UPLOAD_TELEGRAM}" = "false" ] && UPLOAD_TG=false
+
+          # --- Package name ---
+          PACKAGE=$(echo "${IN_PACKAGE:-}" | tr -d '[:space:]')
+          if [ -n "$PACKAGE" ] && ! [[ "$PACKAGE" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "::error::Invalid manager_package_name: '$PACKAGE'"; exit 1
+          fi
+
+          # --- Manager signature ---
+          [ -z "${SIGN_SIZE:-}${SIGN_HASH:-}" ] && SIGN_SIZE="$DEFAULT_SIGN_SIZE" && SIGN_HASH="$DEFAULT_SIGN_HASH"
+          SIGN_SIZE=$(echo "${SIGN_SIZE:-}" | tr -d '[:space:]')
+          SIGN_HASH=$(echo "${SIGN_HASH:-}" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+          SIZE_HEX=""
+          if [ -n "$SIGN_SIZE$SIGN_HASH" ]; then
+            if [ -z "$SIGN_SIZE" ] || [ -z "$SIGN_HASH" ]; then
+              echo "::error::manager_sign_size and manager_sign_hash must be set together."; exit 1
+            fi
+            if [[ "$SIGN_SIZE" =~ ^0[xX][0-9a-fA-F]+$ ]]; then SIZE_DEC=$((SIGN_SIZE))
+            elif [[ "$SIGN_SIZE" =~ ^[0-9]+$ ]]; then SIZE_DEC=$((10#$SIGN_SIZE))
+            else echo "::error::Invalid manager_sign_size: '$SIGN_SIZE'"; exit 1; fi
+            SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
+            [[ "$SIGN_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Invalid manager_sign_hash (need 64 hex chars)"; exit 1; }
+          fi
+
+          {
+            echo "source_repo=$SOURCE_REPO"
+            echo "source_sha=$SOURCE_SHA"
+            echo "build_types=$BUILD_TYPES"
+            echo "ksud_targets=$KSUD_TARGETS"
+            echo "lkm_arches=$LKM_ARCHES"
+            echo "abi_args=$ABI_ARGS"
+            echo "build_lkm=$BUILD_LKM"
+            echo "upload_telegram=$UPLOAD_TG"
+            echo "package_name=$PACKAGE"
+            echo "expected_size=$SIZE_HEX"
+            echo "expected_hash=$SIGN_HASH"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Source      : $SOURCE_REPO @ $SOURCE_REF ($SOURCE_SHA)"
+          echo "Build types : $BUILD_TYPES"
+          echo "ksud targets: $KSUD_TARGETS"
+          echo "LKM         : $BUILD_LKM $LKM_ARCHES"
+          echo "Telegram    : $UPLOAD_TG"
+          echo "Package     : ${PACKAGE:-<default>}"
+          echo "Signature   : ${SIZE_HEX:-<default>} ${SIGN_HASH}"
+
+  build-lkm:
+    needs: prepare
+    if: needs.prepare.outputs.build_lkm == 'true'
+    name: LKM ${{ matrix.kmi }} ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+        arch: ${{ fromJSON(needs.prepare.outputs.lkm_arches) }}
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260828
+      options: --privileged
+    env:
+      EXPECTED_SIZE: ${{ needs.prepare.outputs.expected_size }}
+      EXPECTED_HASH: ${{ needs.prepare.outputs.expected_hash }}
+    steps:
+      - name: Checkout BakaSU source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - name: Add safe directory
+        run: git config --global --add safe.directory '*'
+
+      - name: Build kernelsu.ko (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          cd kernel
+          EXTRA_ARGS=""
+          if [ -n "$EXPECTED_SIZE" ]; then
+            EXTRA_ARGS="KSU_EXPECTED_PR_BUILD_SIZE=$EXPECTED_SIZE KSU_EXPECTED_PR_BUILD_HASH=$EXPECTED_HASH"
+          fi
+          CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CC=clang make $EXTRA_ARGS
+
+          OUT_DIR=/github/workspace/out/aarch64
+          mkdir -p $OUT_DIR
+          cp kernelsu.ko "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko"
+          llvm-strip -d "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko"
+          ls -la "$OUT_DIR"
+
+      - name: Build kernelsu.ko (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: |
+          cd kernel
+          mkdir -p /opt/ddk/kdir-x64
+          unset ARCH CROSS_COMPILE
+          export ARCH=x86_64
+          kmi=${{ matrix.kmi }}
+          pushd /opt/ddk/src/$kmi
+          export KDIR=/opt/ddk/kdir-x64/$kmi
+          MODPOST=scripts/mod/modpost.c
+          sed -i -E 's/^([[:space:]]*)check_exports\(mod\);/\1\/\/ check_exports(mod);/' "$MODPOST"
+          sed -i -E 's/^([[:space:]]*)s->module = exp->module;/\1\/\/ s->module = exp->module;/' "$MODPOST"
+          sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$MODPOST"
+          sed -i 's/__version_ext_names\\") =\\n/__version_ext_names\\") = \\"\\"\\n/' "$MODPOST"
+          make O=$KDIR gki_defconfig
+          scripts/config --file $KDIR/.config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+          if [ "$kmi" == "android16-6.12" ] || [ "$kmi" == "android17-6.18" ]; then
+            scripts/config --file $KDIR/.config -e CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
+          fi
+          make O=$KDIR modules_prepare
+          make O=$KDIR security/selinux/built-in.a
+          popd
+
+          EXTRA_ARGS=""
+          if [ -n "$EXPECTED_SIZE" ]; then
+            EXTRA_ARGS="KSU_EXPECTED_PR_BUILD_SIZE=$EXPECTED_SIZE KSU_EXPECTED_PR_BUILD_HASH=$EXPECTED_HASH"
+          fi
+          MDIR=$(realpath .)
+          FLAGS="CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y"
+          if [ "$kmi" == "android17-6.18" ]; then
+            make -C $KDIR M=$MDIR MO=$MDIR compile_commands.json modules $FLAGS $EXTRA_ARGS
+          else
+            make -C $KDIR M=$MDIR src=$MDIR compile_commands.json modules $FLAGS $EXTRA_ARGS
+          fi
+
+          OUT_DIR=/github/workspace/out/x86_64
+          mkdir -p $OUT_DIR
+          cp kernelsu.ko "$OUT_DIR/${kmi}_kernelsu.ko"
+          llvm-strip -d "$OUT_DIR/${kmi}_kernelsu.ko"
+          ls -la "$OUT_DIR"
+
+      - name: Upload kernelsu.ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: lkm-${{ matrix.arch }}-${{ matrix.kmi }}
+          path: /github/workspace/out/*/${{ matrix.kmi }}_kernelsu.ko
+
+  build-ksud:
+    needs: [prepare, build-lkm]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.build-lkm.result == 'success' || (needs.build-lkm.result == 'skipped' && needs.prepare.outputs.build_lkm == 'false'))
+    name: ksud ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.prepare.outputs.ksud_targets) }}
+    steps:
+      - name: Checkout BakaSU source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Target info
+        id: t
+        run: |
+          case "${{ matrix.target }}" in
+            # bin = ksuinit folder, lkm/lkm_dir = which .ko are embedded and where
+            aarch64-linux-android)   echo "bin=aarch64" >> $GITHUB_OUTPUT; echo "lkm=arm64"  >> $GITHUB_OUTPUT; echo "lkm_dir=aarch64" >> $GITHUB_OUTPUT ;;
+            armv7-linux-androideabi) echo "bin=arm"     >> $GITHUB_OUTPUT; echo "lkm=arm64"  >> $GITHUB_OUTPUT; echo "lkm_dir=aarch64" >> $GITHUB_OUTPUT ;;
+            x86_64-linux-android)    echo "bin=x86_64"  >> $GITHUB_OUTPUT; echo "lkm=x86_64" >> $GITHUB_OUTPUT; echo "lkm_dir=x86_64"  >> $GITHUB_OUTPUT ;;
+            riscv64-linux-android)   echo "bin=riscv64" >> $GITHUB_OUTPUT; echo "lkm="       >> $GITHUB_OUTPUT; echo "lkm_dir="        >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Download LKM
+        if: needs.prepare.outputs.build_lkm == 'true' && steps.t.outputs.lkm != ''
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lkm-${{ steps.t.outputs.lkm }}-*
+          path: lkm
+          merge-multiple: true
+
+      - name: Place LKM
+        if: needs.prepare.outputs.build_lkm == 'true' && steps.t.outputs.lkm != ''
+        run: |
+          mkdir -p userspace/ksud/bin/${{ steps.t.outputs.lkm_dir }}
+          find lkm -name '*_kernelsu.ko' -exec cp -v {} userspace/ksud/bin/${{ steps.t.outputs.lkm_dir }}/ \;
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Setup Rust (nightly)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          if [ "${{ matrix.target }}" != "riscv64-linux-android" ]; then
+            rustup target add --toolchain nightly ${{ matrix.target }}
+          fi
+          rustup default nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ksud-${{ matrix.target }}
+          workspaces: |
+            userspace/ksud
+            userspace/ksuinit
+          cache-targets: true
+          add-job-id-key: false
+          add-rust-environment-hash-key: false
+
+      - name: Build ksuinit
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          T=${{ matrix.target }}
+          case "$T" in
+            aarch64-linux-android)   source .github/scripts/setup-rust-build.sh aarch64-linux-android 26; RT=aarch64 ;;
+            armv7-linux-androideabi) source .github/scripts/setup-rust-build.sh armv7a-linux-androideabi 26 armv7-linux-androideabi; RT=arm ;;
+            x86_64-linux-android)    source .github/scripts/setup-rust-build.sh x86_64-linux-android 26; RT=x86_64 ;;
+            riscv64-linux-android)   source .github/scripts/setup-rust-build.sh riscv64-linux-android 35; RT=riscv64 ;;
+          esac
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-$RT-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cd userspace/ksuinit
+          if [ "$T" = "riscv64-linux-android" ]; then
+            cargo +nightly build -Z build-std=std,panic_abort --package ksuinit --target=$T --release --config ../../.github/riscv64-cargo.toml
+          else
+            cargo build --package ksuinit --target=$T --release
+          fi
+          mkdir -p ../ksud/bin/${{ steps.t.outputs.bin }}
+          cp -v target/$T/release/ksuinit ../ksud/bin/${{ steps.t.outputs.bin }}/ksuinit
+
+      - name: Assemble LKM bootstrap
+        run: |
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o userspace/ksud/.lkm_image_bootstrap.o \
+            userspace/ksud/src/lkm_image_bootstrap.S
+
+      - name: Setup cargo-ndk
+        if: matrix.target != 'riscv64-linux-android'
+        run: cargo install cargo-ndk --locked
+
+      - name: Build ksud
+        env:
+          CUSTOM_PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
+        run: |
+          if [ -n "$CUSTOM_PACKAGE_NAME" ]; then
+            export KSU_PACKAGE_NAME="$CUSTOM_PACKAGE_NAME"
+          fi
+          echo "ksud manager package: ${KSU_PACKAGE_NAME:-<default>}"
+
+          if [ "${{ matrix.target }}" == "riscv64-linux-android" ]; then
+            source .github/scripts/setup-rust-build.sh riscv64-linux-android 35
+            cd userspace/ksud/
+            cargo +nightly build -Z build-std=std,panic_abort --target "$TRIPLE" --release --manifest-path ./Cargo.toml --config ../../.github/riscv64-cargo.toml
+          else
+            cd userspace/ksud/
+            cargo ndk b -P 26 -t ${{ matrix.target }} -r -Z build-std-features="optimize_for_size" -Z trim-paths
+          fi
+
+      - name: Upload ksud
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ matrix.target }}
+          path: userspace/ksud/target/**/release/ksud*
+
+  build-manager:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: ${{ fromJSON(needs.prepare.outputs.build_types) }}
+    defaults:
+      run:
+        working-directory: ./manager
+    steps:
+      - name: Checkout BakaSU source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Checkout this repo (for local icon file)
+        if: inputs.manager_icon != '' && !startsWith(inputs.manager_icon, 'http')
+        uses: actions/checkout@v7
+        with:
+          path: _self
+
+      - name: Write key
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE" ]; then
+            {
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+              echo "KEYSTORE_FILE=key.jks"
+            } >> gradle.properties
+            echo "$KEYSTORE" | base64 -d > key.jks
+          fi
+
+      - name: Set official signature to custom key
+        if: needs.prepare.outputs.expected_size != ''
+        env:
+          SIGN_SIZE: ${{ needs.prepare.outputs.expected_size }}
+          SIGN_HASH: ${{ needs.prepare.outputs.expected_hash }}
+        run: |
+          set -euo pipefail
+          OLD='size: 0x377, hash: d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64'
+          # ksud debug get-sign prints size without zero padding, e.g. 0x2cb
+          NEW="size: $(printf '0x%x' "$SIGN_SIZE"), hash: $SIGN_HASH"
+          FILES=$(grep -rlF "$OLD" app/src || true)
+          if [ -z "$FILES" ]; then
+            echo "::warning::Official signature string not found, the unofficial warning may still show."
+            exit 0
+          fi
+          for f in $FILES; do
+            sed -i "s|$OLD|$NEW|g" "$f"
+            echo "Patched $f -> $NEW"
+          done
+
+      - name: Apply custom icon
+        if: inputs.manager_icon != ''
+        env:
+          ICON_SRC: ${{ inputs.manager_icon }}
+        run: |
+          set -euo pipefail
+          RES=app/src/main/res
+          TMP=$(mktemp -d)
+
+          ICON_SRC=$(echo "$ICON_SRC" | xargs)
+          # github.com/<owner>/<repo>/blob/<ref>/<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>
+          if [[ "$ICON_SRC" =~ ^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$ ]]; then
+            ICON_SRC="https://raw.githubusercontent.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+          fi
+          if [[ "$ICON_SRC" =~ ^https?:// ]]; then
+            echo "Downloading icon: $ICON_SRC"
+            curl -fsSL --max-filesize 10485760 -o "$TMP/src" "$ICON_SRC"
+          else
+            SRC_PATH="$GITHUB_WORKSPACE/_self/${ICON_SRC#/}"
+            test -f "$SRC_PATH" || { echo "::error::Icon file not found in this repo: $ICON_SRC"; exit 1; }
+            cp "$SRC_PATH" "$TMP/src"
+          fi
+
+          command -v convert >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick; }
+          FORMAT=$(identify -format '%m' "$TMP/src[0]" 2>/dev/null || true)
+          case "$FORMAT" in
+            PNG|JPEG|WEBP) echo "Icon format: $FORMAT" ;;
+            *) echo "::error::Unsupported icon format: '${FORMAT:-unknown}' (use png/jpg/webp)"; exit 1 ;;
+          esac
+
+          # Adaptive icon: 108dp canvas, icon scaled to the 72dp visible area, transparent background
+          for d in mdpi:1 hdpi:1.5 xhdpi:2 xxhdpi:3 xxxhdpi:4; do
+            NAME=${d%%:*}; MUL=${d##*:}
+            CANVAS=$(awk "BEGIN{print int(108*$MUL)}")
+            INNER=$(awk "BEGIN{print int(72*$MUL)}")
+            mkdir -p "$RES/mipmap-$NAME"
+            convert "$TMP/src[0]" -background none -resize "${INNER}x${INNER}" \
+              -gravity center -extent "${CANVAS}x${CANVAS}" \
+              "PNG32:$RES/mipmap-$NAME/ic_launcher_custom_foreground.png"
+          done
+
+          for f in ic_launcher ic_launcher_alt; do
+            cat > "$RES/mipmap/$f.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@android:color/transparent" />
+              <foreground android:drawable="@mipmap/ic_launcher_custom_foreground" />
+          </adaptive-icon>
+          XML
+          done
+          echo "Custom icon applied"
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build APK
+        env:
+          CUSTOM_PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
+          CUSTOM_LABEL_NAME: ${{ inputs.manager_label_name }}
+        run: |
+          BUILD_EXTRA_ARGS=()
+          [ -n "$CUSTOM_PACKAGE_NAME" ] && BUILD_EXTRA_ARGS+=("-PKSU_PACKAGE_NAME=$CUSTOM_PACKAGE_NAME")
+          [ -n "$CUSTOM_LABEL_NAME" ] && BUILD_EXTRA_ARGS+=("-PKSU_NAME=$CUSTOM_LABEL_NAME")
+          echo "Package name: ${CUSTOM_PACKAGE_NAME:-<default>}"
+          echo "Label name: ${CUSTOM_LABEL_NAME:-<default>}"
+          ./gradlew assemble${{ matrix.build_type }} -Pcommit=$(git rev-parse HEAD) "${BUILD_EXTRA_ARGS[@]}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Manager-gradle-${{ matrix.build_type }}
+          path: |
+            manager/app/build/outputs/apk/release/*.apk
+            manager/app/build/outputs/apk/debug/*.apk
+
+      - name: Upload mappings
+        uses: actions/upload-artifact@v7
+        with:
+          name: Manager-mappings-${{ matrix.build_type }}
+          path: manager/app/build/outputs/mapping/release/
+          if-no-files-found: ignore
+
+  repack-manager:
+    needs: [prepare, build-manager, build-ksud]
+    if: always() && needs.build-manager.result == 'success' && needs.build-ksud.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: ${{ fromJSON(needs.prepare.outputs.build_types) }}
+    steps:
+      - name: Checkout BakaSU source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - name: Download manager APK
+        uses: actions/download-artifact@v8
+        with:
+          name: Manager-gradle-${{ matrix.build_type }}
+          path: artifacts/Manager-gradle-${{ matrix.build_type }}
+
+      - name: Download ksud
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ksud-*
+          path: artifacts
+
+      - name: Place manager apk and ksud artifacts
+        run: |
+          mkdir -p manager/app/build/outputs/apk/${{ matrix.build_type }}
+          APKS=$(find artifacts/Manager-gradle-${{ matrix.build_type }} -type f -name "*.apk" | tr '\n' ' ')
+          test -n "$APKS"
+          cp -f $APKS manager/app/build/outputs/apk/${{ matrix.build_type }}/
+
+          for t in $(echo '${{ needs.prepare.outputs.ksud_targets }}' | tr -d '[]"' | tr ',' ' '); do
+            # download-artifact skips the per-artifact folder when only one matches,
+            # so search by target path anywhere under artifacts/
+            KSUD=$(find artifacts -type f -name ksud -path "*/$t/*" | head -n 1)
+            test -n "$KSUD" || { echo "::error::ksud not found for $t"; exit 1; }
+            mkdir -p target/$t/release
+            cp -f "$KSUD" target/$t/release/ksud
+            echo "ksud $t -> target/$t/release/ksud"
+          done
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+        run: |
+          test -n "$KEYSTORE" || { echo "::error::Secret KEYSTORE is not set in this repo"; exit 1; }
+          echo "$KEYSTORE" | base64 -d > key.jks
+
+      - name: Repack and resign
+        env:
+          SIGN_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SIGN_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SIGN_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          python3 repack_apk_multi.py repack \
+            -b ${{ matrix.build_type }} \
+            -t release \
+            ${{ needs.prepare.outputs.abi_args }} \
+            -K key.jks \
+            -A "$SIGN_KEY_ALIAS" \
+            -P "$SIGN_KEYSTORE_PASSWORD" \
+            -S "$SIGN_KEY_PASSWORD" \
+            --strip
+
+      - name: Delete gradle build
+        uses: GeekyEggo/delete-artifact@v6
+        with:
+          name: Manager-gradle-${{ matrix.build_type }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Manager-${{ matrix.build_type }}
+          path: dist/*.apk
+
+  telegram-bot-api:
+    name: Telegram Bot API
+    needs: prepare
+    if: needs.prepare.outputs.upload_telegram == 'true' && contains(needs.prepare.outputs.build_types, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Telegram Bot API
+        run: |
+          git clone --recursive https://github.com/tdlib/telegram-bot-api.git
+          git status telegram-bot-api >> telegram-bot-api-status
+      - name: Cache Bot API Binary
+        id: cache-bot-api
+        uses: actions/cache@v6.1.0
+        with:
+          path: telegram-bot-api-binary
+          key: CI-telegram-bot-api-${{ hashFiles('telegram-bot-api-status') }}
+      - name: Compile Telegram Bot API
+        if: steps.cache-bot-api.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install make git zlib1g-dev libssl-dev gperf cmake g++
+          cd telegram-bot-api
+          rm -rf build && mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=.. ..
+          cmake --build . --target install -j$(nproc)
+          cd ../..
+          cp telegram-bot-api/bin/telegram-bot-api telegram-bot-api-binary
+      - name: Upload Binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: telegram-bot-api-binary
+          path: telegram-bot-api-binary
+
+  upload-telegram:
+    needs: [prepare, repack-manager, telegram-bot-api]
+    if: needs.prepare.outputs.upload_telegram == 'true' && contains(needs.prepare.outputs.build_types, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout BakaSU source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Download Release artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: Manager-release
+          path: ./apk/release
+
+      - name: Download Telegram Bot API Binary
+        uses: actions/download-artifact@v8
+        with:
+          name: telegram-bot-api-binary
+          path: .
+
+      - name: Upload to Telegram
+        env:
+          CHAT_ID: ${{ vars.CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          MESSAGE_THREAD_ID: ${{ vars.MESSAGE_THREAD_ID }}
+          DEVELOPING_THREAD_ID: ${{ vars.MESSAGE_DEVELOPING_MANAGER_THREAD_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: Manager
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::warning::BOT_TOKEN is not set, skipping Telegram upload."
+            exit 0
+          fi
+          pip3 install python-telegram-bot
+          export VERSION=$(git rev-list --count HEAD)
+          chmod +x telegram-bot-api-binary
+          python3 scripts/ksubot.py apk/release/*.apk
