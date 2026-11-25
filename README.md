@@ -4,7 +4,7 @@
 
 **Tự build BakaSU Manager bằng GitHub Actions, dùng key ký, icon, tên app và package của riêng bạn**
 
-[![Build Manager](../../actions/workflows/build-manager.yml/badge.svg)](../../actions/workflows/build-manager.yml)
+[![Build Manager](https://github.com/loyldnguyen/CustomSU/actions/workflows/main.yml/badge.svg)](https://github.com/loyldnguyen/CustomSU/actions/workflows/main.yml)
 ![Platform](https://img.shields.io/badge/platform-Android-3DDC84?logo=android&logoColor=white)
 ![ABI](https://img.shields.io/badge/ABI-arm64--v8a%20%7C%20armv7%20%7C%20x86__64%20%7C%20riscv64-blue)
 ![Source](https://img.shields.io/badge/source-Baka--SU%2FBakaSU-ff69b4)
@@ -34,7 +34,7 @@
 Tạo một repo mới (để trống cũng được) rồi thêm file:
 
 ```
-.github/workflows/build-manager.yml
+.github/workflows/main.yml
 ```
 
 ### 2. Tạo keystore
